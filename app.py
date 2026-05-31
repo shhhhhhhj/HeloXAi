@@ -2471,25 +2471,31 @@ async def root():
 
 async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool, style: str = None, size: str = "1024x1024"):
     """
-    UPDATED: Uses FLUX.1 Schnell via Replicate for faster, high-quality image generation.
+    FIXED: Moves generation logic INSIDE the stream generator for real-time updates.
+    Also includes better logging to diagnose token issues.
     """
+    
+    # 1. Validate Token
     if not REPLICATE_API_TOKEN:
+        logger.error("Image generation failed: REPLICATE_API_TOKEN is missing.")
         msg = "Replicate API Token not configured."
-        async def err_gen(): yield sse({"type": "error", "message": msg})
-        if stream: return StreamingResponse(err_gen(), media_type="text/event-stream")
+        
+        if stream:
+            async def err_gen():
+                yield sse({"type": "error", "message": msg})
+            return StreamingResponse(err_gen(), media_type="text/event-stream")
         return {"error": msg}
     
     if not prompt or not prompt.strip(): 
         raise HTTPException(400, "Prompt is required")
 
-    # Map DALL-E size to FLUX aspect ratio
+    # 2. Prepare Inputs (Done outside generator)
     aspect_ratio = "1:1"
     if "1792x1024" in size or "16:9" in size:
         aspect_ratio = "16:9"
     elif "1024x1792" in size or "9:16" in size:
         aspect_ratio = "9:16"
 
-    # Append style to prompt if provided
     if style:
         prompt = f"{prompt}, {style} style"
 
@@ -2498,7 +2504,6 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
         "Content-Type": "application/json",
     }
 
-    # Replicate Input Payload for FLUX Schnell
     input_payload = {
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
@@ -2506,69 +2511,91 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
         "disable_safety_checker": False 
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=600.0) as client: # 10 min timeout
-            # 1. Start Prediction
-            r = await client.post(
-                "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
-                headers=headers,
-                json={"input": input_payload}
-            )
+    # 3. Define the Generator
+    async def event_gen():
+        logger.info(f"[FLUX] Starting generation for prompt: {prompt[:50]}...")
+        yield sse({"type": "status", "message": "Initializing generation..."})
 
-            if r.status_code != 201:
-                logger.error(f"Replicate Start Error: {r.text}")
-                raise Exception(f"Failed to start image generation: {r.text}")
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                # Start Prediction
+                yield sse({"type": "status", "message": "Sending request to Replicate..."})
+                r = await client.post(
+                    "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
+                    headers=headers,
+                    json={"input": input_payload}
+                )
 
-            prediction = r.json()
-            get_url = prediction.get("urls", {}).get("get")
+                if r.status_code != 201:
+                    logger.error(f"Replicate Start Error {r.status_code}: {r.text}")
+                    yield sse({"type": "error", "message": f"Failed to start generation: {r.text}"})
+                    return
 
-            # 2. Polling Loop
-            output_url = None
-            poll_count = 0
-            max_polls = 120 # Approx 2 mins
-
-            while poll_count < max_polls:
-                r = await client.get(get_url, headers=headers)
-                data = r.json()
-                status = data.get("status")
-
-                if status == "succeeded":
-                    output = data.get("output")
-                    if isinstance(output, list) and len(output) > 0:
-                        output_url = output[0]
-                    else:
-                        output_url = output
-                    break
-                elif status == "failed" or status == "canceled":
-                    error_detail = data.get("error", "Unknown error")
-                    logger.error(f"Replicate Generation Failed: {error_detail}")
-                    raise Exception(f"Image generation failed: {error_detail}")
+                prediction = r.json()
+                get_url = prediction.get("urls", {}).get("get")
                 
-                await asyncio.sleep(1)
-                poll_count += 1
+                if not get_url:
+                    logger.error("Replicate response missing 'get' URL")
+                    yield sse({"type": "error", "message": "Invalid response from Replicate"})
+                    return
 
-            if not output_url:
-                raise Exception("Image generation timed out.")
+                # Polling Loop
+                output_url = None
+                poll_count = 0
+                max_polls = 120 # Approx 2 mins
+                
+                logger.info("[FLUX] Polling for results...")
 
-    except Exception as e:
-        logger.error(f"Image gen error: {e}")
-        msg = str(e)
-        async def err_gen(): yield sse({"type": "error", "message": msg})
-        if stream: return StreamingResponse(err_gen(), media_type="text/event-stream")
-        return {"error": msg}
+                while poll_count < max_polls:
+                    r = await client.get(get_url, headers=headers)
+                    data = r.json()
+                    status = data.get("status")
 
-    # Return Result
-    images = [{"url": output_url, "revised_prompt": prompt}]
+                    if status == "succeeded":
+                        output = data.get("output")
+                        output_url = output[0] if isinstance(output, list) else output
+                        logger.info(f"[FLUX] Generation successful: {output_url}")
+                        break
+                    
+                    elif status == "failed" or status == "canceled":
+                        error_detail = data.get("error", "Unknown error")
+                        logger.error(f"[FLUX] Generation failed: {error_detail}")
+                        yield sse({"type": "error", "message": f"Generation failed: {error_detail}"})
+                        return
+                    
+                    # Optional: Send heartbeat to frontend so it knows we're still working
+                    if poll_count % 5 == 0:
+                         yield sse({"type": "status", "message": "Processing..."})
 
-    if stream:
-        async def event_gen():
-            yield sse({"type": "status", "message": "Image generated successfully."})
-            yield sse({"type": "images", "images": images})
+                    await asyncio.sleep(1)
+                    poll_count += 1
+
+                if not output_url:
+                    logger.error("[FLUX] Generation timed out")
+                    yield sse({"type": "error", "message": "Generation timed out."})
+                    return
+
+            # Send Success
+            yield sse({"type": "status", "message": "Finalizing..."})
+            yield sse({"type": "images", "images": [{"url": output_url, "revised_prompt": prompt}]})
             yield sse({"type": "done"})
+
+        except httpx.RequestError as e:
+            logger.error(f"[FLUX] Network Error: {e}")
+            yield sse({"type": "error", "message": f"Network error: {str(e)}"})
+        except Exception as e:
+            logger.error(f"[FLUX] Unexpected Error: {e}", exc_info=True)
+            yield sse({"type": "error", "message": str(e)})
+
+    # 4. Return Response
+    if stream:
         return StreamingResponse(event_gen(), media_type="text/event-stream")
-
-    return {"images": images}
-
+    
+    # Fallback for non-stream (rarely used in this setup)
+    # Note: For non-stream, we'd have to await the generator manually, 
+    # but typically this endpoint is always streamed.
+    return {"error": "Non-streaming mode not fully implemented for FLUX in this version."}
+    
 async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
     """
     Robust Video Generation using FLUX Schnell -> Stable Video Diffusion pipeline.
