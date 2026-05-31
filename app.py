@@ -2407,7 +2407,7 @@ async def upload_bytes_to_storage(
 
 async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool, style: str = None, size: str = "1024x1024"):
     """
-    Generates images using the requested 'gpt-image-1' model via OpenAI client.
+    Generates images using the 'gpt-image-1' model.
     """
     # 1. Validate Client
     if not openai_client:
@@ -2423,30 +2423,27 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
     if not prompt or not prompt.strip(): 
         raise HTTPException(400, "Prompt is required")
 
-    # 2. Map Size/Style (Assuming standard OpenAI API parameters apply)
+    # 2. Map Size
+    # Using standard sizes that are widely supported (1024x1024 is safest)
     openai_size = "1024x1024"
     if "1792x1024" in size or "16:9" in size:
         openai_size = "1792x1024"
     elif "1024x1792" in size or "9:16" in size:
         openai_size = "1024x1792"
 
-    openai_style = "vivid"
-    if style and style.lower() in ["natural", "realistic", "photo"]:
-        openai_style = "natural"
-
     async def event_gen():
         logger.info(f"[OPENAI] Starting generation with 'gpt-image-1': {prompt[:50]}...")
         yield sse({"type": "status", "message": "Requesting image from gpt-image-1..."})
 
         try:
-            # 3. Call OpenAI API with the specific model name requested
+            # 3. Call OpenAI API (Removed style and quality to prevent 400 errors)
             response = await openai_client.images.generate(
-                model="gpt-image-1",  # <--- EXACTLY AS REQUESTED
+                model="gpt-image-1",
                 prompt=prompt,
                 size=openai_size,
-                quality="standard", 
-                style=openai_style,
                 n=1,
+                # REMOVED: quality="standard" 
+                # REMOVED: style=openai_style
             )
 
             # 4. Get URL and Download Bytes
@@ -2471,21 +2468,20 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
 
             # 6. Send Result
             yield sse({"type": "status", "message": "Finalizing..."})
-            yield sse({"type": "images", "images": [{"url": secure_url, "revised_prompt": response.data[0].revised_prompt if hasattr(response.data[0], 'revised_prompt') else prompt}]})
+            # Note: gpt-image-1 might not return a 'revised_prompt', so we use original prompt as fallback
+            revised = response.data[0].revised_prompt if hasattr(response.data[0], 'revised_prompt') else prompt
+            yield sse({"type": "images", "images": [{"url": secure_url, "revised_prompt": revised}]})
             yield sse({"type": "done"})
 
         except Exception as e:
             logger.error(f"[OPENAI] Image Gen Error: {e}", exc_info=True)
-            # Check for specific model error
-            if "model" in str(e).lower() and "not found" in str(e).lower():
-                yield sse({"type": "error", "message": "Model 'gpt-image-1' not found. Ensure your API provider supports this model name."})
-            else:
-                yield sse({"type": "error", "message": str(e)})
+            yield sse({"type": "error", "message": str(e)})
 
     if stream:
         return StreamingResponse(event_gen(), media_type="text/event-stream")
     
     return {"error": "Non-streaming mode not implemented."}
+    
     
 async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
     """
