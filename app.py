@@ -2398,66 +2398,92 @@ async def upload_bytes_to_storage(
         b64_data = base64.b64encode(file_bytes).decode('utf-8')
         return f"data:{content_type};base64,{b64_data}"
 
+# =========================
+# MEDIA GENERATION HANDLERS (OPENAI - CUSTOM MODEL)
+# =========================
+
 async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool, style: str = None, size: str = "1024x1024"):
     """
-    Generates images using Stable Diffusion 3 Medium (SOTA).
+    Generates images using the requested 'gpt-image-1' model via OpenAI client.
     """
-    if not HUGGINGFACE_API_TOKEN:
-        msg = "Hugging Face API Token not configured."
+    # 1. Validate Client
+    if not openai_client:
+        logger.error("Image generation failed: OPENAI_API_KEY is missing.")
+        msg = "OpenAI API Token not configured."
+        
         if stream:
-            async def err_gen(): yield sse({"type": "error", "message": msg})
+            async def err_gen():
+                yield sse({"type": "error", "message": msg})
             return StreamingResponse(err_gen(), media_type="text/event-stream")
         return {"error": msg}
 
     if not prompt or not prompt.strip(): 
         raise HTTPException(400, "Prompt is required")
 
-    # BEST IMAGE MODEL: Stable Diffusion 3 Medium
-    API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-3-medium"
-    
-    # Fallback if SD3 is unavailable/gated: FLUX.1-schnell
-    # API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+    # 2. Map Size/Style (Assuming standard OpenAI API parameters apply)
+    openai_size = "1024x1024"
+    if "1792x1024" in size or "16:9" in size:
+        openai_size = "1792x1024"
+    elif "1024x1792" in size or "9:16" in size:
+        openai_size = "1024x1792"
 
-    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}"}
+    openai_style = "vivid"
+    if style and style.lower() in ["natural", "realistic", "photo"]:
+        openai_style = "natural"
 
     async def event_gen():
-        logger.info(f"[SD3] Starting generation for: {prompt[:50]}...")
-        yield sse({"type": "status", "message": "Generating masterpiece (SD3 Medium)..."})
+        logger.info(f"[OPENAI] Starting generation with 'gpt-image-1': {prompt[:50]}...")
+        yield sse({"type": "status", "message": "Requesting image from gpt-image-1..."})
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                payload = {"inputs": prompt}
-                
-                response = await client.post(API_URL, headers=headers, json=payload)
-                
-                if response.status_code != 200:
-                    error_text = response.text
-                    logger.error(f"SD3 API Error {response.status_code}: {error_text}")
-                    
-                    if response.status_code == 503:
-                        yield sse({"type": "error", "message": "Model is loading (Cold Start). Try again in 1 minute."})
-                    elif "gated" in error_text.lower():
-                        yield sse({"type": "error", "message": "SD3 is a gated model. Please accept the license on Hugging Face."})
-                    else:
-                        yield sse({"type": "error", "message": f"Generation failed: {error_text}"})
-                    return
+            # 3. Call OpenAI API with the specific model name requested
+            response = await openai_client.images.generate(
+                model="gpt-image-1",  # <--- EXACTLY AS REQUESTED
+                prompt=prompt,
+                size=openai_size,
+                quality="standard", 
+                style=openai_style,
+                n=1,
+            )
 
-                image_bytes = response.content
-                
-                filename = f"sd3_{uuid.uuid4().hex[:8]}.jpg"
-                image_url = await upload_bytes_to_storage(image_bytes, filename, "image/jpeg")
+            # 4. Get URL and Download Bytes
+            image_url = response.data[0].url
+            
+            yield sse({"type": "status", "message": "Download and secure image..."})
 
-                yield sse({"type": "status", "message": "Done!"})
-                yield sse({"type": "images", "images": [{"url": image_url, "revised_prompt": prompt}]})
-                yield sse({"type": "done"})
+            async with httpx.AsyncClient(timeout=30.0) as dl_client:
+                img_resp = await dl_client.get(image_url)
+                if img_resp.status_code != 200:
+                    raise Exception("Failed to download image from API")
+                image_bytes = img_resp.content
+
+            # 5. Upload to Supabase Storage
+            filename = f"gptimg_{uuid.uuid4().hex[:8]}.png"
+            secure_url = await upload_bytes_to_storage(
+                image_bytes, 
+                filename, 
+                "image/png", 
+                bucket="ai-videos"
+            )
+
+            # 6. Send Result
+            yield sse({"type": "status", "message": "Finalizing..."})
+            yield sse({"type": "images", "images": [{"url": secure_url, "revised_prompt": response.data[0].revised_prompt if hasattr(response.data[0], 'revised_prompt') else prompt}]})
+            yield sse({"type": "done"})
 
         except Exception as e:
-            logger.error(f"[SD3] Error: {e}", exc_info=True)
-            yield sse({"type": "error", "message": str(e)})
+            logger.error(f"[OPENAI] Image Gen Error: {e}", exc_info=True)
+            # Check for specific model error
+            if "model" in str(e).lower() and "not found" in str(e).lower():
+                yield sse({"type": "error", "message": "Model 'gpt-image-1' not found. Ensure your API provider supports this model name."})
+            else:
+                yield sse({"type": "error", "message": str(e)})
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
-
-
+    if stream:
+        return StreamingResponse(event_gen(), media_type="text/event-stream")
+    
+    return {"error": "Non-streaming mode not implemented."}
+    
 async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
     """
     Generates videos using the SOTA Pipeline: SD3 Medium (Image) -> SVD XT (Video).
