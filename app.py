@@ -43,7 +43,7 @@ logger = logging.getLogger("HeloXAi")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for backend Admin access
-GROQ_API_KEY = os.getenv("GROQ_API_KEY").strip() if os.getenv("GROQ_API_KEY") else None
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Make sure this is set in Render!
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # UPDATED: Using Hugging Face instead of Replicate
