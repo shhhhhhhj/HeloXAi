@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Union, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-
+from openai import AsyncOpenAI
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Cookie, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,6 +51,9 @@ HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # NEW: For live research & images
 LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
+
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
 
 # File handling config
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
