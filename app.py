@@ -43,17 +43,16 @@ logger = logging.getLogger("HeloXAi")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for backend Admin access
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Make sure this is set in Render!
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# UPDATED: Using Hugging Face instead of Replicate
+# Using Hugging Face for Free Image/Video Generation
 HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # NEW: For live research & images
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # For live research & images
 LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
 
 # File handling config
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
@@ -68,13 +67,12 @@ SESSION_DURATION = 365 * 24 * 60 * 60  # 1 year in seconds
 REFRESH_THRESHOLD = 7 * 24 * 60 * 60  # Refresh session if less than 7 days remaining
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    # Service Key is required for the Backend API to bypass RLS for custom cookie auth
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set for this backend.")
 
 app = FastAPI(
     title="HeloxAi API",
-    description="Advanced AI Assistant Backend",
-    version="2.6.0" # Updated for Hugging Face SD3/SVD
+    description="Advanced AI Assistant Backend - Free Media & Math Focused",
+    version="2.7.0" # Updated for HF Image Gen & Math/Translation Prompts
 )
 
 # CORS
@@ -2359,7 +2357,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "2.6.0",
+        "version": "2.7.0",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2367,13 +2365,15 @@ async def root():
             "session_management": "persistent",
             "memory": "intelligent_llm_consolidation",
             "chat_management": "global_sorted",
-            "media_generation": "hugging_face_sd3_svd",
-            "web_search": "tavily_with_images"
+            "media_generation": "free_hugging_face_sd3_svd",
+            "web_search": "tavily_with_images",
+            "math_logic": "step_by_step_reasoning",
+            "translation": "native_llm_capability"
         }
     }
 
 # =========================
-# MEDIA GENERATION HANDLERS (HUGGING FACE - BEST OF BEST)
+# MEDIA GENERATION HANDLERS (HUGGING FACE - FREE)
 # =========================
 
 async def upload_bytes_to_storage(
@@ -2401,19 +2401,13 @@ async def upload_bytes_to_storage(
         b64_data = base64.b64encode(file_bytes).decode('utf-8')
         return f"data:{content_type};base64,{b64_data}"
 
-# =========================
-# MEDIA GENERATION HANDLERS (OPENAI - CUSTOM MODEL)
-# =========================
-
 async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool, style: str = None, size: str = "1024x1024"):
     """
-    Generates images using the 'gpt-image-1' model.
+    Generates images using Hugging Face (Stable Diffusion 3 Medium) for FREE.
     """
-    # 1. Validate Client
-    if not openai_client:
-        logger.error("Image generation failed: OPENAI_API_KEY is missing.")
-        msg = "OpenAI API Token not configured."
-        
+    if not HUGGINGFACE_API_TOKEN:
+        logger.error("Image generation failed: HUGGINGFACE_API_TOKEN is missing.")
+        msg = "Hugging Face API Token not configured."
         if stream:
             async def err_gen():
                 yield sse({"type": "error", "message": msg})
@@ -2423,42 +2417,31 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
     if not prompt or not prompt.strip(): 
         raise HTTPException(400, "Prompt is required")
 
-    # 2. Map Size
-    # Using standard sizes that are widely supported (1024x1024 is safest)
-    openai_size = "1024x1024"
-    if "1792x1024" in size or "16:9" in size:
-        openai_size = "1792x1024"
-    elif "1024x1792" in size or "9:16" in size:
-        openai_size = "1024x1792"
-
     async def event_gen():
-        logger.info(f"[OPENAI] Starting generation with 'gpt-image-1': {prompt[:50]}...")
-        yield sse({"type": "status", "message": "Requesting image from gpt-image-1..."})
+        logger.info(f"[HF] Starting image generation with SD3 Medium: {prompt[:50]}...")
+        yield sse({"type": "status", "message": "Generating image (Free Model)..."})
 
         try:
-            # 3. Call OpenAI API (Removed style and quality to prevent 400 errors)
-            response = await openai_client.images.generate(
-                model="gpt-image-1",
-                prompt=prompt,
-                size=openai_size,
-                n=1,
-                # REMOVED: quality="standard" 
-                # REMOVED: style=openai_style
-            )
-
-            # 4. Get URL and Download Bytes
-            image_url = response.data[0].url
+            # Using Stability AI SD3 Medium on Hugging Face Inference API
+            API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-3-medium"
+            headers = {"Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}"}
             
-            yield sse({"type": "status", "message": "Download and secure image..."})
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(API_URL, headers=headers, json={"inputs": prompt})
+                
+                if response.status_code != 200:
+                    error_text = response.text
+                    logger.error(f"HF API Error: {error_text}")
+                    # Often HF returns 503 if model is loading, or 500 for other issues
+                    if response.status_code == 503:
+                        yield sse({"type": "error", "message": "Model is loading, please try again in a few moments."})
+                    else:
+                        yield sse({"type": "error", "message": f"Generation failed: {response.status_code}"})
+                    return
 
-            async with httpx.AsyncClient(timeout=30.0) as dl_client:
-                img_resp = await dl_client.get(image_url)
-                if img_resp.status_code != 200:
-                    raise Exception("Failed to download image from API")
-                image_bytes = img_resp.content
+                image_bytes = response.content
 
-            # 5. Upload to Supabase Storage
-            filename = f"gptimg_{uuid.uuid4().hex[:8]}.png"
+            filename = f"sd3_{uuid.uuid4().hex[:8]}.png"
             secure_url = await upload_bytes_to_storage(
                 image_bytes, 
                 filename, 
@@ -2466,15 +2449,12 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
                 bucket="ai-videos"
             )
 
-            # 6. Send Result
             yield sse({"type": "status", "message": "Finalizing..."})
-            # Note: gpt-image-1 might not return a 'revised_prompt', so we use original prompt as fallback
-            revised = response.data[0].revised_prompt if hasattr(response.data[0], 'revised_prompt') else prompt
-            yield sse({"type": "images", "images": [{"url": secure_url, "revised_prompt": revised}]})
+            yield sse({"type": "images", "images": [{"url": secure_url, "revised_prompt": prompt}]})
             yield sse({"type": "done"})
 
         except Exception as e:
-            logger.error(f"[OPENAI] Image Gen Error: {e}", exc_info=True)
+            logger.error(f"[HF] Image Gen Error: {e}", exc_info=True)
             yield sse({"type": "error", "message": str(e)})
 
     if stream:
@@ -2485,7 +2465,7 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
     
 async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
     """
-    Generates videos using the SOTA Pipeline: SD3 Medium (Image) -> SVD XT (Video).
+    Generates videos using the SOTA Free Pipeline: SD3 Medium (Image) -> SVD XT (Video).
     """
     if not HUGGINGFACE_API_TOKEN:
         async def err_gen(): yield sse({"type": "error", "message": "API Keys missing."})
@@ -2616,19 +2596,19 @@ async def ask_universal(req: Request, res: Response):
         logger.info(f"Intent Detected: {intent.intent.value} (Confidence: {intent.confidence:.2f})")
         
         if intent.intent == IntentCategory.IMAGE_GENERATION:
-            logger.info("Routing to Image Generation Handler")
+            logger.info("Routing to Image Generation Handler (Free HF)")
             return await handle_image_generation(prompt, user, conv_id, stream)
             
         elif intent.intent == IntentCategory.VIDEO_GENERATION:
-            logger.info("Routing to Video Generation Handler")
+            logger.info("Routing to Video Generation Handler (Free HF)")
             return await handle_video_generation(prompt, user, conv_id, stream)
             
         elif intent.intent in [IntentCategory.CODE_GENERATION, IntentCategory.CODE_DEBUG, IntentCategory.CODE_REVIEW]:
              logger.info("Routing to Code Assistant")
-             pass
+             return await handle_code_assistant(prompt, user, conv_id, stream)
 
     # =========================
-    # CONVERSATION HANDLING (Text/Code/Search)
+    # CONVERSATION HANDLING (Text/Code/Search/Math/Translation)
     # =========================
     
     needs_search = False
@@ -2708,6 +2688,14 @@ async def ask_universal(req: Request, res: Response):
                 history = history[-MAX_MESSAGES:]
 
                 base_system = get_system_prompt(prompt)
+                
+                # Intent-Specific Prompt Engineering for Free Models (LLM)
+                if intent:
+                    if intent.intent == IntentCategory.MATHEMATICAL:
+                        base_system += "\n\nYou are a mathematical expert. For any calculation or proof, think step-by-step. If the problem requires complex computation, output a Python script to solve it."
+                    elif intent.intent == IntentCategory.TRANSLATION:
+                        base_system += "\n\nYou are a professional translator. Provide accurate, context-aware translations. If the target language isn't specified, ask for it. Maintain the tone of the original text."
+                
                 user_memory = user.get("memory", "")
                 if user_memory:
                     base_system += f"\n\nUser Context: {user_memory}"
@@ -2752,6 +2740,13 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         
         history = await get_history(conv_id)
         base_system = get_system_prompt(prompt)
+        
+        if intent:
+            if intent.intent == IntentCategory.MATHEMATICAL:
+                base_system += "\n\nYou are a mathematical expert. Think step-by-step."
+            elif intent.intent == IntentCategory.TRANSLATION:
+                base_system += "\n\nYou are a professional translator."
+
         if user.get("memory"): base_system += f"\n\nUser Context: {user['memory']}"
         if search_context: base_system += f"\n\nWEB RESULTS:\n{search_context}"
         
@@ -3036,7 +3031,7 @@ async def validate_session(req: Request, res: Response):
         "valid": user.get("session_valid", False),
         "user_id": user["id"],
         "fingerprint": user.get("fingerprint", "")[:8] + "...",
-        "is_authenticated": bool(user.get("email") and not user["email"].startswith("anon+"))
+        "is_authenticated": bool(user.get("email") and not user.get("email").startswith("anon+"))
     }
 
 @app.post("/session/refresh")
@@ -3213,6 +3208,15 @@ async def regenerate(req: Request, res: Response):
             
             last_prompt = last_user_msg.get("content", "")
             base_system = get_system_prompt(last_prompt)
+            
+            # Re-check intent for regeneration prompt engineering
+            intent = detect_intent(last_prompt)
+            if intent:
+                if intent.intent == IntentCategory.MATHEMATICAL:
+                    base_system += "\n\nYou are a mathematical expert. Think step-by-step."
+                elif intent.intent == IntentCategory.TRANSLATION:
+                    base_system += "\n\nYou are a professional translator."
+
             user_memory = user.get("memory", "")
             if user_memory:
                 base_system += f"\n\nUser Context: {user_memory}"
@@ -3267,7 +3271,7 @@ async def get_user_info(req: Request, res: Response):
         "fingerprint": user.get("fingerprint", "")[:8] + "...",
         "is_identified": True,
         "session_valid": user.get("session_valid", False),
-        "is_authenticated": bool(user.get("email") and not user["email"].startswith("anon+"))
+        "is_authenticated": bool(user.get("email") and not user.get("email").startswith("anon+"))
     }
 
 @app.post("/user/merge")
