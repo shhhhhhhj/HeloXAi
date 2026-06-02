@@ -108,13 +108,31 @@ kokoro_pipeline = None
 async def startup_event():
     global kokoro_pipeline
     try:
-        logger.info("Loading Kokoro TTS model... this may take a moment.")
-        # Initialize KPipeline directly from the submodule
-        # Use 'cpu' for compatibility, or 'cuda' if you have a GPU
-        kokoro_pipeline = KPipeline(lang_code='a', device='cpu') 
-        logger.info("Kokoro TTS model loaded successfully.")
+        # We import here to prevent top-level crashes and to allow debugging
+        try:
+            import kokoro_onnx
+            logger.info(f"DEBUG: Contents of kokoro_onnx module: {dir(kokoro_onnx)}")
+        except ImportError:
+            logger.error("kokoro_onnx is not installed. Please run: pip install kokoro-onnx")
+            return
+
+        # Try to import KPipeline (Standard way)
+        try:
+            from kokoro_onnx import KPipeline
+            kokoro_pipeline = KPipeline(lang_code='a', device='cpu')
+            logger.info("Kokoro TTS model loaded successfully (Standard Import).")
+        
+        # If that fails, the package structure is weird. Log it and exit gracefully.
+        except ImportError as e:
+            logger.error(f"Failed to import KPipeline from kokoro_onnx: {e}")
+            logger.error("The installed 'kokoro-onnx' package seems corrupted or is the wrong version.")
+            logger.error("Please ensure you have run: pip install kokoro-onnx --force-reinstall")
+            # We set it to None so the app doesn't crash, but TTS will fail later
+            kokoro_pipeline = None 
+
     except Exception as e:
-        logger.error(f"Failed to load Kokoro model: {e}")
+        logger.error(f"General error loading Kokoro model: {e}")
+        kokoro_pipeline = None
         
 # =========================
 # FILE TYPE DEFINITIONS
