@@ -16,7 +16,9 @@ groq
 uvloop[standard]
 imageio
 slowapi==0.1.5
-fitz 
+PyMuPDF           # Module name: fitz (Replaces 'fitz')
+kokoro-onnx       # ✅ Added: Local High-Quality TTS
+einops            # ✅ Added: Dependency for Kokoro/Tensor ops
 
 # SUPABASE / DATABASE
 supabase==2.9.0
@@ -31,6 +33,7 @@ pydantic-settings==2.4.0
 textblob==0.18.0
 sumy==0.11.0
 deep-translator==1.10.1
+PyPDF2            # ✅ Added: Required for PDF extraction in file handler
 
 # OPENAI / LLM
 openai==1.33.0
