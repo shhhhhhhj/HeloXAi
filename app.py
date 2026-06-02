@@ -30,7 +30,7 @@ import time
 
 import httpx
 from supabase import create_client, create_async_client
-from kokoro_onnx import KPipeline
+from kokoro_onnx.kokoro import KPipeline
 
 # =========================
 # CONFIG & LOGGING
@@ -109,12 +109,13 @@ async def startup_event():
     global kokoro_pipeline
     try:
         logger.info("Loading Kokoro TTS model... this may take a moment.")
-        # Initialize Kokoro pipeline (American English by default)
-        kokoro_pipeline = kokoro.KPipeline(lang_code='a')
+        # Initialize KPipeline directly from the submodule
+        # Use 'cpu' for compatibility, or 'cuda' if you have a GPU
+        kokoro_pipeline = KPipeline(lang_code='a', device='cpu') 
         logger.info("Kokoro TTS model loaded successfully.")
     except Exception as e:
         logger.error(f"Failed to load Kokoro model: {e}")
-
+        
 # =========================
 # FILE TYPE DEFINITIONS
 # =========================
