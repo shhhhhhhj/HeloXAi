@@ -10,6 +10,7 @@ import zipfile
 import tempfile
 import mimetypes
 import shutil
+import wave
 from fastapi import UploadFile, File, Form 
 import cv2  
 import numpy as np
@@ -29,6 +30,7 @@ import time
 
 import httpx
 from supabase import create_client, create_async_client
+import kokoro
 
 # =========================
 # CONFIG & LOGGING
@@ -72,7 +74,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi API",
     description="Advanced AI Assistant Backend - Free Media & Math Focused",
-    version="2.7.0" # Updated for HF Image Gen & Math/Translation Prompts
+    version="2.8.0" # Updated for Kokoro TTS
 )
 
 # CORS
@@ -95,6 +97,23 @@ active_streams: Dict[str, asyncio.Task] = {}
 _session_cache: Dict[str, Dict[str, Any]] = {}
 _session_cache_ttl = 300  # 5 minutes
 _session_cache_last_cleanup = time.time()
+
+# Kokoro TTS Pipeline Global Variable
+kokoro_pipeline = None
+
+# =========================
+# STARTUP EVENT
+# =========================
+@app.on_event("startup")
+async def startup_event():
+    global kokoro_pipeline
+    try:
+        logger.info("Loading Kokoro TTS model... this may take a moment.")
+        # Initialize Kokoro pipeline (American English by default)
+        kokoro_pipeline = kokoro.KPipeline(lang_code='a')
+        logger.info("Kokoro TTS model loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load Kokoro model: {e}")
 
 # =========================
 # FILE TYPE DEFINITIONS
@@ -1580,7 +1599,7 @@ class RegenerateRequest(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str
-    voice: str = "alloy"
+    voice: str = "af_heart" # Default to a Kokoro voice
 
 class IntentInfo(BaseModel):
     intent: str
@@ -2357,7 +2376,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "2.7.0",
+        "version": "2.8.0",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2368,7 +2387,8 @@ async def root():
             "media_generation": "free_hugging_face_sd3_svd",
             "web_search": "tavily_with_images",
             "math_logic": "step_by_step_reasoning",
-            "translation": "native_llm_capability"
+            "translation": "native_llm_capability",
+            "tts": "kokoro_local_onnx"
         }
     }
 
@@ -3332,48 +3352,80 @@ async def analyze_intent_endpoint(req: Request):
     }
 
 # =========================
-# MEDIA ENDPOINTS (OPTIMIZED FOR SPEED)
+# MEDIA ENDPOINTS (KOKORO TTS)
 # =========================
 
 @app.post("/tts")
 async def text_to_speech(req: Request):
+    if kokoro_pipeline is None:
+        raise HTTPException(503, "Kokoro TTS model is still loading or not initialized.")
+    
     data = await req.json()
-    text = data.get("text")
-    voice = data.get("voice", "alloy")
+    text = data.get("text", "")
+    # Default voice if not provided (af_heart is a standard Kokoro voice)
+    voice = data.get("voice", "af_heart")
 
     if not text:
         raise HTTPException(400, "text required")
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "OpenAI Key missing")
+
+    # Run generation in a thread pool to avoid blocking the event loop
+    def generate_audio():
+        audio_segments = []
+        # Kokoro pipeline returns a generator
+        generator = kokoro_pipeline(text, voice=voice)
+        for i, (gs, ps, audio) in enumerate(generator):
+            audio_segments.append(audio)
+        
+        if not audio_segments:
+            return None
+            
+        # Concatenate segments (usually just one for short text)
+        full_audio = np.concatenate(audio_segments)
+        
+        # Kokoro returns float32, convert to int16 for WAV
+        int16_audio = (full_audio * 32767).astype(np.int16)
+        
+        # Write to BytesIO buffer
+        buf = BytesIO()
+        with wave.open(buf, 'wb') as f:
+            f.setnchannels(1) # Mono
+            f.setsampwidth(2) # 16-bit
+            f.setframerate(24000) # Kokoro default sample rate
+            f.writeframes(int16_audio.tobytes())
+        
+        buf.seek(0)
+        return buf.read()
+
+    try:
+        audio_bytes = await asyncio.to_thread(generate_audio)
+    except Exception as e:
+        logger.error(f"Kokoro generation failed: {e}")
+        raise HTTPException(500, f"Audio generation failed: {str(e)}")
+
+    if audio_bytes is None:
+        raise HTTPException(500, "No audio generated")
 
     async def stream_audio():
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream(
-                "POST",
-                "https://api.openai.com/v1/audio/speech",
-                headers=get_openai_headers(),
-                json={"model": "tts-1", "voice": voice, "input": text, "response_format": "mp3"}
-            ) as response:
-                if response.status_code != 200:
-                    error_body = await response.aread()
-                    logger.error(f"TTS Error: {error_body}")
-                    return
-                
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+        yield audio_bytes
 
-    return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+    return StreamingResponse(stream_audio(), media_type="audio/wav")
 
 @app.get("/tts/voices")
 async def get_voices():
+    # Standard voices provided by Kokoro
     return {
         "voices": [
-            {"id": "alloy", "name": "Alloy"},
-            {"id": "echo", "name": "Echo"},
-            {"id": "fable", "name": "Fable"},
-            {"id": "onyx", "name": "Onyx"},
-            {"id": "nova", "name": "Nova"},
-            {"id": "shimmer", "name": "Shimmer"}
+            {"id": "af_heart", "name": "American Female (Heart)", "gender": "Female", "accent": "American"},
+            {"id": "af_bella", "name": "American Female (Bella)", "gender": "Female", "accent": "American"},
+            {"id": "af_nicole", "name": "American Female (Nicole)", "gender": "Female", "accent": "American"},
+            {"id": "af_sarah", "name": "American Female (Sarah)", "gender": "Female", "accent": "American"},
+            {"id": "af_sky", "name": "American Female (Sky)", "gender": "Female", "accent": "American"},
+            {"id": "am_michael", "name": "American Male (Michael)", "gender": "Male", "accent": "American"},
+            {"id": "am_adam", "name": "American Male (Adam)", "gender": "Male", "accent": "American"},
+            {"id": "bf_emma", "name": "British Female (Emma)", "gender": "Female", "accent": "British"},
+            {"id": "bf_isabella", "name": "British Female (Isabella)", "gender": "Female", "accent": "British"},
+            {"id": "bm_george", "name": "British Male (George)", "gender": "Male", "accent": "British"},
+            {"id": "bm_lewis", "name": "British Male (Lewis)", "gender": "Male", "accent": "British"},
         ]
     }
 
