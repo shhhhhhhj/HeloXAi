@@ -30,7 +30,7 @@ import time
 
 import httpx
 from supabase import create_client, create_async_client
-from kokoro_onnx.kokoro import KPipeline
+
 
 # =========================
 # CONFIG & LOGGING
