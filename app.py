@@ -104,6 +104,9 @@ kokoro_pipeline = None
 # =========================
 # STARTUP EVENT
 # =========================
+# =========================
+# STARTUP EVENT
+# =========================
 @app.on_event("startup")
 async def startup_event():
     global kokoro_pipeline
@@ -116,19 +119,28 @@ async def startup_event():
             logger.error("kokoro_onnx is not installed. Please run: pip install kokoro-onnx")
             return
 
-        # Try to import KPipeline (Standard way)
+        # Try to import KPipeline (Standard way in older versions)
         try:
             from kokoro_onnx import KPipeline
             kokoro_pipeline = KPipeline(lang_code='a', device='cpu')
-            logger.info("Kokoro TTS model loaded successfully (Standard Import).")
+            logger.info("Kokoro TTS model loaded successfully (Standard Import - KPipeline).")
         
-        # If that fails, the package structure is weird. Log it and exit gracefully.
-        except ImportError as e:
-            logger.error(f"Failed to import KPipeline from kokoro_onnx: {e}")
-            logger.error("The installed 'kokoro-onnx' package seems corrupted or is the wrong version.")
-            logger.error("Please ensure you have run: pip install kokoro-onnx --force-reinstall")
-            # We set it to None so the app doesn't crash, but TTS will fail later
-            kokoro_pipeline = None 
+        # If that fails, try the new class structure observed in your logs
+        except ImportError:
+            logger.warning("KPipeline not found, attempting to import 'Kokoro' class directly...")
+            try:
+                from kokoro_onnx import Kokoro
+                
+                # NOTE: The Kokoro class usually requires the path to the .onnx model file.
+                # If your environment has the model at a default location, this might work.
+                # Otherwise, you may need to provide the path: Kokoro(model_path="...")
+                kokoro_pipeline = Kokoro()
+                
+                logger.info("Kokoro TTS model loaded successfully (Fallback Import - Kokoro Class).")
+            except Exception as e:
+                logger.error(f"Failed to initialize Kokoro class: {e}")
+                logger.error("You likely need to specify the model path in the Kokoro() constructor.")
+                kokoro_pipeline = None 
 
     except Exception as e:
         logger.error(f"General error loading Kokoro model: {e}")
