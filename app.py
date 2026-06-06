@@ -7,10 +7,11 @@ import asyncio
 import logging
 import hashlib
 import zipfile
-import tempfile
 import mimetypes
-import shutil
-import wave
+import time
+
+import httpx
+from supabase import create_client, create_async_client
 from fastapi import UploadFile, File, Form 
 import cv2  
 import numpy as np
@@ -20,16 +21,10 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Union, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from openai import AsyncOpenAI
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Cookie, Header
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
-from fastapi.responses import PlainTextResponse
-import time
-
-import httpx
-from supabase import create_client, create_async_client
 
 
 # =========================
@@ -44,17 +39,17 @@ logger = logging.getLogger("HeloXAi")
 # Environment Variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for backend Admin access
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") 
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+# Using OpenRouter for the main LLM (Qwen)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# Using OpenAI for Vision, STT, and TTS
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Using Hugging Face for Free Image/Video Generation
+# Hugging Face for Image/Video Generation
 HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # For live research & images
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
-
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # File handling config
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
@@ -73,8 +68,8 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 app = FastAPI(
     title="HeloxAi API",
-    description="Advanced AI Assistant Backend - Free Media & Math Focused",
-    version="2.8.1" # Updated version for Kokoro Fix
+    description="Advanced AI Assistant Backend - OpenRouter & OpenAI Integrated",
+    version="3.0.0" # Updated version
 )
 
 # CORS
@@ -98,84 +93,14 @@ _session_cache: Dict[str, Dict[str, Any]] = {}
 _session_cache_ttl = 300  # 5 minutes
 _session_cache_last_cleanup = time.time()
 
-# Kokoro TTS Pipeline Global Variable
-kokoro_pipeline = None
-
-# Configuration for Kokoro Model Files
-KOKORO_MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", "/app/kokoro.onnx")
-KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", "/app/voices.json")
-
-# Direct URLs to the official model files
-KOKORO_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/v0.3.1/kokoro-v1.0.onnx"
-KOKORO_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/v0.3.1/voices.json"
-
-async def download_kokoro_file(url: str, path: str):
-    """Helper to download large files with a progress log"""
-    logger.info(f"Downloading {url} to {path}...")
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        response = await client.get(url, follow_redirects=True)
-        if response.status_code == 200:
-            with open(path, "wb") as f:
-                f.write(response.content)
-            logger.info(f"Successfully downloaded {path}")
-        else:
-            raise RuntimeError(f"Failed to download {url}: Status {response.status_code}")
-
 # =========================
 # STARTUP EVENT
 # =========================
 @app.on_event("startup")
 async def startup_event():
-    global kokoro_pipeline
-    
-    # 1. Ensure Model Files Exist (Download if missing)
-    try:
-        if not os.path.exists(KOKORO_MODEL_PATH):
-            logger.warning(f"Model file not found at {KOKORO_MODEL_PATH}. Starting download...")
-            await download_kokoro_file(KOKORO_MODEL_URL, KOKORO_MODEL_PATH)
-            
-        if not os.path.exists(KOKORO_VOICES_PATH):
-            logger.warning(f"Voices file not found at {KOKORO_VOICES_PATH}. Starting download...")
-            await download_kokoro_file(KOKORO_VOICES_URL, KOKORO_VOICES_PATH)
-            
-    except Exception as e:
-        logger.error(f"Failed to prepare Kokoro model files: {e}")
-        logger.error("TTS will be unavailable. Check internet connection or manually mount model files.")
-        kokoro_pipeline = None
-        return
+    # Kokoro Removed - Using OpenAI TTS instead
+    logger.info("HeloxAi Backend Started. Models: OpenRouter (Qwen), OpenAI (Vision/STT/TTS).")
 
-    # 2. Import and Initialize Pipeline
-    try:
-        import kokoro_onnx
-        logger.info(f"DEBUG: Contents of kokoro_onnx module: {dir(kokoro_onnx)}")
-
-        # Strategy A: Try importing KPipeline (Standard in some versions)
-        try:
-            from kokoro_onnx import KPipeline
-            kokoro_pipeline = KPipeline(lang_code='a', device='cpu')
-            logger.info("Kokoro TTS model loaded successfully via KPipeline.")
-        
-        # Strategy B: Fallback to Kokoro class (Requires paths)
-        except ImportError:
-            logger.warning("KPipeline not found, attempting to initialize 'Kokoro' class directly...")
-            try:
-                from kokoro_onnx import Kokoro
-                
-                # Initialize with the required paths
-                kokoro_pipeline = Kokoro(
-                    model_path=KOKORO_MODEL_PATH, 
-                    voices_path=KOKORO_VOICES_PATH
-                )
-                logger.info("Kokoro TTS model loaded successfully via Kokoro class.")
-                
-            except Exception as e:
-                logger.error(f"Failed to initialize Kokoro class: {e}")
-                kokoro_pipeline = None
-
-    except Exception as e:
-        logger.error(f"General error loading Kokoro model: {e}")
-        kokoro_pipeline = None
-        
 # =========================
 # FILE TYPE DEFINITIONS
 # =========================
@@ -1653,14 +1578,14 @@ class ChatRequest(BaseModel):
     prompt: str
     conversation_id: Optional[str] = None
     stream: bool = True
-    remember: bool = True  # New: persist session
+    remember: bool = True
 
 class RegenerateRequest(BaseModel):
     conversation_id: str
 
 class TTSRequest(BaseModel):
     text: str
-    voice: str = "af_heart" # Default to a Kokoro voice
+    voice: str = "alloy" # Default to OpenAI alloy
 
 class IntentInfo(BaseModel):
     intent: str
@@ -1899,10 +1824,10 @@ Updated Memory:"""
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 r = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=get_groq_headers(),
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "HTTP-Referer": "https://heloxai.xyz", "X-Title": "HeloXAi", "Content-Type": "application/json"},
                     json={
-                        "model": "llama-3.3-70b-versatile",
+                        "model": "qwen/qwen-2.5-72b-instruct", # Use Qwen for memory too
                         "messages": messages,
                         "max_tokens": 300,
                         "temperature": 0.1
@@ -1945,14 +1870,19 @@ Updated Memory:"""
 
     logger.error(f"Failed to update memory for {user_id[:8]} after {max_retries} retries due to rate limiting.")
 
-def get_groq_headers():
-    return {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-
 def get_openai_headers():
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
+def get_openrouter_headers():
+    return {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://heloxai.xyz",
+        "X-Title": "HeloXAi",
+        "Content-Type": "application/json"
+    }
+
 # =========================
-# WEB SEARCH INTEGRATION (TAVILY) - UPDATED
+# WEB SEARCH INTEGRATION (TAVILY)
 # =========================
 async def perform_web_search(query: str) -> Dict[str, Any]:
     """Performs a web search using Tavily API and returns formatted results + images."""
@@ -2003,6 +1933,7 @@ async def perform_web_search(query: str) -> Dict[str, Any]:
 # =========================
 
 def get_video_duration(video_bytes: bytes) -> float:
+    import tempfile
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
         tmp_file.write(video_bytes)
         tmp_file_path = tmp_file.name
@@ -2027,6 +1958,7 @@ def get_video_duration(video_bytes: bytes) -> float:
             os.remove(tmp_file_path)
 
 def extract_video_frames(video_bytes: bytes, max_frames: int = 4) -> list:
+    import tempfile
     frames_b64 = []
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
@@ -2201,7 +2133,7 @@ Preserve important technical details.{file_context}"""
         async def gen():
             task = asyncio.current_task()
             try:
-                async for token in stream_groq_chat(messages):
+                async for token in stream_openrouter_chat(messages):
                     if task.cancelled():
                         break
                     yield sse({"type": "token", "text": token})
@@ -2214,10 +2146,10 @@ Preserve important technical details.{file_context}"""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=get_groq_headers(),
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=get_openrouter_headers(),
             json={
-                "model": "llama-3.3-70b-versatile",
+                "model": "qwen/qwen-2.5-72b-instruct",
                 "messages": messages
             }
         )
@@ -2304,7 +2236,7 @@ async def get_history(conv_id: str, limit: int = 50):
     
     return [{"role": m["role"], "content": m["content"]} for m in final_messages]
 
-async def stream_groq_chat(messages: list, model: str = "llama-3.3-70b-versatile", max_tokens: int = 8192):
+async def stream_openrouter_chat(messages: list, model: str = "qwen/qwen-2.5-72b-instruct", max_tokens: int = 8192):
     max_retries = 2
     base_wait = 5
     
@@ -2313,19 +2245,19 @@ async def stream_groq_chat(messages: list, model: str = "llama-3.3-70b-versatile
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream(
                     "POST",
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=get_groq_headers(),
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=get_openrouter_headers(),
                     json={"model": model, "messages": messages, "stream": True, "max_tokens": max_tokens}
                 ) as resp:
                     
                     if resp.status_code == 429:
-                        logger.warning(f"Groq Rate Limit hit (Attempt {attempt+1}). Waiting...")
+                        logger.warning(f"OpenRouter Rate Limit hit (Attempt {attempt+1}). Waiting...")
                         await asyncio.sleep(base_wait * (attempt + 1))
                         continue 
 
                     if resp.status_code != 200:
                         error_text = await resp.aread()
-                        logger.error(f"Groq API Error {resp.status_code}: {error_text}")
+                        logger.error(f"OpenRouter API Error {resp.status_code}: {error_text}")
                         raise Exception(f"AI Service Error ({resp.status_code})")
 
                     async for line in resp.aiter_lines():
@@ -2368,7 +2300,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
             active_streams[user["id"]] = task
             try:
                 full_text = ""
-                async for token in stream_groq_chat(messages):
+                async for token in stream_openrouter_chat(messages):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2394,9 +2326,9 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=get_groq_headers(),
-            json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 8000}
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=get_openrouter_headers(),
+            json={"model": "qwen/qwen-2.5-72b-instruct", "messages": messages, "max_tokens": 8000}
         )
         r.raise_for_status()
         reply = r.json()["choices"][0]["message"]["content"]
@@ -2437,7 +2369,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "2.8.1",
+        "version": "3.0.0",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2449,7 +2381,8 @@ async def root():
             "web_search": "tavily_with_images",
             "math_logic": "step_by_step_reasoning",
             "translation": "native_llm_capability",
-            "tts": "kokoro_local_onnx"
+            "tts": "openai",
+            "llm": "openrouter_qwen"
         }
     }
 
@@ -2513,7 +2446,6 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
                 if response.status_code != 200:
                     error_text = response.text
                     logger.error(f"HF API Error: {error_text}")
-                    # Often HF returns 503 if model is loading, or 500 for other issues
                     if response.status_code == 503:
                         yield sse({"type": "error", "message": "Model is loading, please try again in a few moments."})
                     else:
@@ -2557,6 +2489,7 @@ async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: st
     async def gen():
         image_bytes = None
         tmp_img_path = None
+        import tempfile
         
         try:
             # STEP 1: Generate High-Quality Image (SD3 Medium)
@@ -2791,7 +2724,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
 
                 full_history = [{"role": "system", "content": base_system}] + history
 
-                async for token in stream_groq_chat(full_history):
+                async for token in stream_openrouter_chat(full_history):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2834,8 +2767,8 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         full_history = [{"role": "system", "content": base_system}] + history
         
         async with httpx.AsyncClient() as client:
-            r = await groq_request_with_retry(client, {
-                "model": "llama-3.3-70b-versatile",
+            r = await openrouter_request_with_retry(client, {
+                "model": "qwen/qwen-2.5-72b-instruct",
                 "messages": full_history,
                 "max_tokens": 1024
             })
@@ -3058,7 +2991,7 @@ Be organized and clear in your analysis."""
                     "files": result.files
                 })
                 
-                async for token in stream_groq_chat(messages):
+                async for token in stream_openrouter_chat(messages):
                     if task.cancelled():
                         break
                     yield sse({"type": "token", "text": token})
@@ -3071,9 +3004,9 @@ Be organized and clear in your analysis."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=get_groq_headers(),
-            json={"model": "llama-3.3-70b-versatile", "messages": messages}
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=get_openrouter_headers(),
+            json={"model": "qwen/qwen-2.5-72b-instruct", "messages": messages}
         )
         r.raise_for_status()
 
@@ -3213,13 +3146,13 @@ async def stop_generation(req: Request, res: Response):
         return {"status": "stopped"}
     return {"status": "no_active_stream"}
 
-async def groq_request_with_retry(client, payload):
+async def openrouter_request_with_retry(client, payload):
     max_retries = 5
     for attempt in range(max_retries):
         try:
             r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=get_groq_headers(),
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=get_openrouter_headers(),
                 json=payload
             )
             r.raise_for_status()
@@ -3304,7 +3237,7 @@ async def regenerate(req: Request, res: Response):
             full_history = [{"role": "system", "content": base_system}] + history
             
             full_text = ""
-            async for token in stream_groq_chat(full_history):
+            async for token in stream_openrouter_chat(full_history):
                 if task and task.cancelled():
                     break
                 full_text += token
@@ -3413,80 +3346,68 @@ async def analyze_intent_endpoint(req: Request):
     }
 
 # =========================
-# MEDIA ENDPOINTS (KOKORO TTS)
+# MEDIA ENDPOINTS (OPENAI TTS/STT)
 # =========================
 
 @app.post("/tts")
 async def text_to_speech(req: Request):
-    if kokoro_pipeline is None:
-        raise HTTPException(503, "Kokoro TTS model is still loading or not initialized.")
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OpenAI API Key missing")
     
     data = await req.json()
     text = data.get("text", "")
-    # Default voice if not provided (af_heart is a standard Kokoro voice)
-    voice = data.get("voice", "af_heart")
+    voice = data.get("voice", "alloy")
+
+    valid_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+    if voice not in valid_voices:
+        raise HTTPException(400, f"Invalid voice. Choose from {valid_voices}")
 
     if not text:
         raise HTTPException(400, "text required")
 
-    # Run generation in a thread pool to avoid blocking the event loop
-    def generate_audio():
-        audio_segments = []
-        # Kokoro pipeline returns a generator
-        generator = kokoro_pipeline(text, voice=voice)
-        for i, (gs, ps, audio) in enumerate(generator):
-            audio_segments.append(audio)
-        
-        if not audio_segments:
-            return None
-            
-        # Concatenate segments (usually just one for short text)
-        full_audio = np.concatenate(audio_segments)
-        
-        # Kokoro returns float32, convert to int16 for WAV
-        int16_audio = (full_audio * 32767).astype(np.int16)
-        
-        # Write to BytesIO buffer
-        buf = BytesIO()
-        with wave.open(buf, 'wb') as f:
-            f.setnchannels(1) # Mono
-            f.setsampwidth(2) # 16-bit
-            f.setframerate(24000) # Kokoro default sample rate
-            f.writeframes(int16_audio.tobytes())
-        
-        buf.seek(0)
-        return buf.read()
-
     try:
-        audio_bytes = await asyncio.to_thread(generate_audio)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "tts-1",
+                    "input": text,
+                    "voice": voice
+                }
+            )
+            
+            if response.status_code != 200:
+                error_text = response.text
+                logger.error(f"OpenAI TTS Error: {error_text}")
+                raise HTTPException(response.status_code, f"TTS Failed: {error_text}")
+
+            audio_bytes = response.content
+
+            async def stream_audio():
+                yield audio_bytes
+
+            return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+            
+    except httpx.ConnectError:
+        raise HTTPException(500, "Connection failed.")
     except Exception as e:
-        logger.error(f"Kokoro generation failed: {e}")
+        logger.error(f"OpenAI TTS Exception: {e}")
         raise HTTPException(500, f"Audio generation failed: {str(e)}")
-
-    if audio_bytes is None:
-        raise HTTPException(500, "No audio generated")
-
-    async def stream_audio():
-        yield audio_bytes
-
-    return StreamingResponse(stream_audio(), media_type="audio/wav")
 
 @app.get("/tts/voices")
 async def get_voices():
-    # Standard voices provided by Kokoro
     return {
         "voices": [
-            {"id": "af_heart", "name": "American Female (Heart)", "gender": "Female", "accent": "American"},
-            {"id": "af_bella", "name": "American Female (Bella)", "gender": "Female", "accent": "American"},
-            {"id": "af_nicole", "name": "American Female (Nicole)", "gender": "Female", "accent": "American"},
-            {"id": "af_sarah", "name": "American Female (Sarah)", "gender": "Female", "accent": "American"},
-            {"id": "af_sky", "name": "American Female (Sky)", "gender": "Female", "accent": "American"},
-            {"id": "am_michael", "name": "American Male (Michael)", "gender": "Male", "accent": "American"},
-            {"id": "am_adam", "name": "American Male (Adam)", "gender": "Male", "accent": "American"},
-            {"id": "bf_emma", "name": "British Female (Emma)", "gender": "Female", "accent": "British"},
-            {"id": "bf_isabella", "name": "British Female (Isabella)", "gender": "Female", "accent": "British"},
-            {"id": "bm_george", "name": "British Male (George)", "gender": "Male", "accent": "British"},
-            {"id": "bm_lewis", "name": "British Male (Lewis)", "gender": "Male", "accent": "British"},
+            {"id": "alloy", "name": "Alloy", "gender": "Neutral", "accent": "American"},
+            {"id": "echo", "name": "Echo", "gender": "Male", "accent": "American"},
+            {"id": "fable", "name": "Fable", "gender": "British", "accent": "British"},
+            {"id": "onyx", "name": "Onyx", "gender": "Male", "accent": "American"},
+            {"id": "nova", "name": "Nova", "gender": "Female", "accent": "American"},
+            {"id": "shimmer", "name": "Shimmer", "gender": "Female", "accent": "American"},
         ]
     }
 
