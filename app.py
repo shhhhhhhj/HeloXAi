@@ -74,7 +74,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi API",
     description="Advanced AI Assistant Backend - Free Media & Math Focused",
-    version="2.8.0" # Updated for Kokoro TTS
+    version="2.8.1" # Updated version for Kokoro Fix
 )
 
 # CORS
@@ -101,46 +101,76 @@ _session_cache_last_cleanup = time.time()
 # Kokoro TTS Pipeline Global Variable
 kokoro_pipeline = None
 
-# =========================
-# STARTUP EVENT
-# =========================
+# Configuration for Kokoro Model Files
+KOKORO_MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", "/app/kokoro.onnx")
+KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", "/app/voices.json")
+
+# Direct URLs to the official model files
+KOKORO_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/v0.3.1/kokoro-v1.0.onnx"
+KOKORO_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/v0.3.1/voices.json"
+
+async def download_kokoro_file(url: str, path: str):
+    """Helper to download large files with a progress log"""
+    logger.info(f"Downloading {url} to {path}...")
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        response = await client.get(url, follow_redirects=True)
+        if response.status_code == 200:
+            with open(path, "wb") as f:
+                f.write(response.content)
+            logger.info(f"Successfully downloaded {path}")
+        else:
+            raise RuntimeError(f"Failed to download {url}: Status {response.status_code}")
+
 # =========================
 # STARTUP EVENT
 # =========================
 @app.on_event("startup")
 async def startup_event():
     global kokoro_pipeline
+    
+    # 1. Ensure Model Files Exist (Download if missing)
     try:
-        # We import here to prevent top-level crashes and to allow debugging
-        try:
-            import kokoro_onnx
-            logger.info(f"DEBUG: Contents of kokoro_onnx module: {dir(kokoro_onnx)}")
-        except ImportError:
-            logger.error("kokoro_onnx is not installed. Please run: pip install kokoro-onnx")
-            return
+        if not os.path.exists(KOKORO_MODEL_PATH):
+            logger.warning(f"Model file not found at {KOKORO_MODEL_PATH}. Starting download...")
+            await download_kokoro_file(KOKORO_MODEL_URL, KOKORO_MODEL_PATH)
+            
+        if not os.path.exists(KOKORO_VOICES_PATH):
+            logger.warning(f"Voices file not found at {KOKORO_VOICES_PATH}. Starting download...")
+            await download_kokoro_file(KOKORO_VOICES_URL, KOKORO_VOICES_PATH)
+            
+    except Exception as e:
+        logger.error(f"Failed to prepare Kokoro model files: {e}")
+        logger.error("TTS will be unavailable. Check internet connection or manually mount model files.")
+        kokoro_pipeline = None
+        return
 
-        # Try to import KPipeline (Standard way in older versions)
+    # 2. Import and Initialize Pipeline
+    try:
+        import kokoro_onnx
+        logger.info(f"DEBUG: Contents of kokoro_onnx module: {dir(kokoro_onnx)}")
+
+        # Strategy A: Try importing KPipeline (Standard in some versions)
         try:
             from kokoro_onnx import KPipeline
             kokoro_pipeline = KPipeline(lang_code='a', device='cpu')
-            logger.info("Kokoro TTS model loaded successfully (Standard Import - KPipeline).")
+            logger.info("Kokoro TTS model loaded successfully via KPipeline.")
         
-        # If that fails, try the new class structure observed in your logs
+        # Strategy B: Fallback to Kokoro class (Requires paths)
         except ImportError:
-            logger.warning("KPipeline not found, attempting to import 'Kokoro' class directly...")
+            logger.warning("KPipeline not found, attempting to initialize 'Kokoro' class directly...")
             try:
                 from kokoro_onnx import Kokoro
                 
-                # NOTE: The Kokoro class usually requires the path to the .onnx model file.
-                # If your environment has the model at a default location, this might work.
-                # Otherwise, you may need to provide the path: Kokoro(model_path="...")
-                kokoro_pipeline = Kokoro()
+                # Initialize with the required paths
+                kokoro_pipeline = Kokoro(
+                    model_path=KOKORO_MODEL_PATH, 
+                    voices_path=KOKORO_VOICES_PATH
+                )
+                logger.info("Kokoro TTS model loaded successfully via Kokoro class.")
                 
-                logger.info("Kokoro TTS model loaded successfully (Fallback Import - Kokoro Class).")
             except Exception as e:
                 logger.error(f"Failed to initialize Kokoro class: {e}")
-                logger.error("You likely need to specify the model path in the Kokoro() constructor.")
-                kokoro_pipeline = None 
+                kokoro_pipeline = None
 
     except Exception as e:
         logger.error(f"General error loading Kokoro model: {e}")
@@ -2407,7 +2437,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "2.8.0",
+        "version": "2.8.1",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
