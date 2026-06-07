@@ -9,10 +9,11 @@ import hashlib
 import zipfile
 import mimetypes
 import time
+import tempfile
 
 import httpx
 from supabase import create_client, create_async_client
-from fastapi import UploadFile, File, Form 
+from fastapi import UploadFile, File 
 import cv2  
 import numpy as np
 from io import BytesIO
@@ -24,7 +25,8 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Cookie, Header
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, validator
+from contextlib import asynccontextmanager
+from pydantic import BaseModel
 
 
 # =========================
@@ -66,10 +68,22 @@ REFRESH_THRESHOLD = 7 * 24 * 60 * 60  # Refresh session if less than 7 days rema
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set for this backend.")
 
+# =========================
+# LIFESPAN EVENT HANDLER
+# =========================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("HeloxAi Backend Started. Models: OpenRouter (Qwen), OpenAI (Vision/STT/TTS).")
+    yield
+    # Shutdown
+    logger.info("Shutting down HeloxAi Backend...")
+
 app = FastAPI(
     title="HeloxAi API",
     description="Advanced AI Assistant Backend - OpenRouter & OpenAI Integrated",
-    version="3.0.0" # Updated version
+    version="3.0.1",
+    lifespan=lifespan
 )
 
 # CORS
@@ -93,13 +107,6 @@ _session_cache: Dict[str, Dict[str, Any]] = {}
 _session_cache_ttl = 300  # 5 minutes
 _session_cache_last_cleanup = time.time()
 
-# =========================
-# STARTUP EVENT
-# =========================
-@app.on_event("startup")
-async def startup_event():
-    # Kokoro Removed - Using OpenAI TTS instead
-    logger.info("HeloxAi Backend Started. Models: OpenRouter (Qwen), OpenAI (Vision/STT/TTS).")
 
 # =========================
 # FILE TYPE DEFINITIONS
@@ -1827,7 +1834,7 @@ Updated Memory:"""
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "HTTP-Referer": "https://heloxai.xyz", "X-Title": "HeloXAi", "Content-Type": "application/json"},
                     json={
-                        "model": "qwen/qwen-2.5-72b-instruct", # Use Qwen for memory too
+                        "model": "qwen/qwen-2.5-72b-instruct",
                         "messages": messages,
                         "max_tokens": 300,
                         "temperature": 0.1
@@ -1933,7 +1940,6 @@ async def perform_web_search(query: str) -> Dict[str, Any]:
 # =========================
 
 def get_video_duration(video_bytes: bytes) -> float:
-    import tempfile
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
         tmp_file.write(video_bytes)
         tmp_file_path = tmp_file.name
@@ -1958,7 +1964,6 @@ def get_video_duration(video_bytes: bytes) -> float:
             os.remove(tmp_file_path)
 
 def extract_video_frames(video_bytes: bytes, max_frames: int = 4) -> list:
-    import tempfile
     frames_b64 = []
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
@@ -1998,7 +2003,6 @@ async def add_watermark_to_video(video_url: str) -> str:
     """Add transparent watermark to video"""
     try:
         from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
-        import tempfile
         
         logo_bytes = await fetch_logo_image()
         if not logo_bytes:
@@ -2369,7 +2373,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "3.0.0",
+        "version": "3.0.1",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2489,7 +2493,6 @@ async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: st
     async def gen():
         image_bytes = None
         tmp_img_path = None
-        import tempfile
         
         try:
             # STEP 1: Generate High-Quality Image (SD3 Medium)
@@ -2551,7 +2554,7 @@ async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: st
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 # =========================
-# MAIN ENDPOINT (UPDATED FOR CHATGPT FEELING)
+# MAIN ENDPOINT (FIXED LOGIC)
 # =========================
 
 @app.post("/ask/universal")
@@ -2601,7 +2604,54 @@ async def ask_universal(req: Request, res: Response):
     user = await get_user(req, res, remember=remember)
 
     # =========================
-    # INTENT DETECTION & ROUTING (FIXED)
+    # FIX: VALIDATE/CREATE CONVERSATION BEFORE ROUTING
+    # =========================
+    
+    # Check if conversation ID is valid and belongs to user
+    conversation_exists = False
+    if conv_id:
+        check = await _execute_supabase_with_retry(
+            supabase.table("conversations")
+            .select("id")
+            .eq("id", conv_id)
+            .eq("user_id", user["id"])
+            .limit(1)
+        )
+        if check.data:
+            conversation_exists = True
+        else:
+            logger.warning(f"Conversation {conv_id} not found or access denied. Creating new.")
+            conv_id = None # Force creation of new ID
+
+    if not conv_id:
+        conv_id = str(uuid.uuid4())
+        conversation_exists = False
+    
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Ensure conversation exists in DB
+    if not conversation_exists:
+        await _execute_supabase_with_retry(
+            supabase.table("conversations").insert({
+                "id": conv_id,
+                "user_id": user["id"],
+                "title": prompt[:30],
+                "created_at": now_iso,
+                "updated_at": now_iso
+            })
+        )
+    else:
+        await _execute_supabase_with_retry(
+            supabase.table("conversations").update({
+                "updated_at": now_iso
+            }).eq("id", conv_id)
+        )
+
+    # Save User Message immediately
+    await save_message(user["id"], conv_id, "user", prompt)
+
+    # =========================
+    # INTENT DETECTION & ROUTING
     # =========================
     
     intent = detect_intent(prompt)
@@ -2632,46 +2682,6 @@ async def ask_universal(req: Request, res: Response):
     search_keywords = ["latest", "news", "current", "recent", "today", "who is", "what is", "price", "weather", "stock"]
     if any(kw in prompt.lower() for kw in search_keywords):
         needs_search = True
-
-    conversation_exists = False
-    
-    if conv_id:
-        check = await _execute_supabase_with_retry(
-            supabase.table("conversations")
-            .select("id")
-            .eq("id", conv_id)
-            .eq("user_id", user["id"])
-            .limit(1)
-        )
-        if check.data:
-            conversation_exists = True
-        else:
-            logger.warning(f"Conversation {conv_id} not found. Creating new.")
-            conv_id = None
-
-    if not conv_id:
-        conv_id = str(uuid.uuid4())
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    if not conversation_exists:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations").insert({
-                "id": conv_id,
-                "user_id": user["id"],
-                "title": prompt[:30],
-                "created_at": now_iso,
-                "updated_at": now_iso
-            })
-        )
-    else:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations").update({
-                "updated_at": now_iso
-            }).eq("id", conv_id)
-        )
-
-    await save_message(user["id"], conv_id, "user", prompt)
 
     if stream:
         async def event_gen():
