@@ -13,7 +13,7 @@ import tempfile
 
 import httpx
 from supabase import create_client, create_async_client
-from fastapi import UploadFile, File 
+from fastapi import UploadFile, File, Form 
 import cv2  
 import numpy as np
 from io import BytesIO
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Union, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Cookie, Header
+from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Cookie, Header, Form
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HeloxAi API",
     description="Advanced AI Assistant Backend - OpenRouter & OpenAI Integrated",
-    version="3.0.1",
+    version="3.0.2",
     lifespan=lifespan
 )
 
@@ -1999,6 +1999,19 @@ def extract_video_frames(video_bytes: bytes, max_frames: int = 4) -> list:
         if os.path.exists(tmp_file_path):
             os.remove(tmp_file_path)
 
+async def fetch_logo_image() -> Optional[bytes]:
+    """Fetches the logo image for watermarking"""
+    if not LOGO_URL:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(LOGO_URL)
+            if response.status_code == 200:
+                return response.content
+    except Exception as e:
+        logger.warning(f"Failed to fetch logo: {e}")
+    return None
+
 async def add_watermark_to_video(video_url: str) -> str:
     """Add transparent watermark to video"""
     try:
@@ -2373,7 +2386,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "3.0.1",
+        "version": "3.0.2",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
