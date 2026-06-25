@@ -7,12 +7,9 @@ import asyncio
 import logging
 import hashlib
 import zipfile
-import mimetypes
-import time
 import tempfile
-
-import httpx
-from supabase import create_client, create_async_client
+import mimetypes
+import shutil
 from fastapi import UploadFile, File, Form 
 import cv2  
 import numpy as np
@@ -22,12 +19,16 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Union, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Cookie, Header, Form
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from openai import AsyncOpenAI
+from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Cookie, Header
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
+from fastapi.responses import PlainTextResponse
+import time
 
+import httpx
+from supabase import create_client, create_async_client
 
 # =========================
 # CONFIG & LOGGING
@@ -41,17 +42,17 @@ logger = logging.getLogger("HeloXAi")
 # Environment Variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-# Using OpenRouter for the main LLM (Qwen)
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-# Using OpenAI for Vision, STT, and TTS
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for backend Admin access
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Hugging Face for Image/Video Generation
+# Using Hugging Face for Free Image/Video Generation
 HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # For live research & images
 LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
+
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # File handling config
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
@@ -68,35 +69,20 @@ REFRESH_THRESHOLD = 7 * 24 * 60 * 60  # Refresh session if less than 7 days rema
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set for this backend.")
 
-# =========================
-# LIFESPAN EVENT HANDLER
-# =========================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("HeloxAi Backend Started. Models: OpenRouter (Qwen), OpenAI (Vision/STT/TTS).")
-    yield
-    # Shutdown
-    logger.info("Shutting down HeloxAi Backend...")
-
 app = FastAPI(
     title="HeloxAi API",
-    description="Advanced AI Assistant Backend - OpenRouter & OpenAI Integrated",
-    version="3.0.2",
-    lifespan=lifespan
+    description="Advanced AI Assistant Backend - Free Media & Math Focused",
+    version="2.7.0" # Updated for HF Image Gen & Math/Translation Prompts
 )
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://heloxai.xyz",
-        "https://www.heloxai.xyz",
-    ],
+    allow_origins=["https://heloxai.xyz"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
+    expose_headers=["*"]
 )
 
 # Database Clients
@@ -109,7 +95,6 @@ active_streams: Dict[str, asyncio.Task] = {}
 _session_cache: Dict[str, Dict[str, Any]] = {}
 _session_cache_ttl = 300  # 5 minutes
 _session_cache_last_cleanup = time.time()
-
 
 # =========================
 # FILE TYPE DEFINITIONS
@@ -1588,14 +1573,14 @@ class ChatRequest(BaseModel):
     prompt: str
     conversation_id: Optional[str] = None
     stream: bool = True
-    remember: bool = True
+    remember: bool = True  # New: persist session
 
 class RegenerateRequest(BaseModel):
     conversation_id: str
 
 class TTSRequest(BaseModel):
     text: str
-    voice: str = "alloy" # Default to OpenAI alloy
+    voice: str = "alloy"
 
 class IntentInfo(BaseModel):
     intent: str
@@ -1834,10 +1819,10 @@ Updated Memory:"""
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 r = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "HTTP-Referer": "https://heloxai.xyz", "X-Title": "HeloXAi", "Content-Type": "application/json"},
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=get_groq_headers(),
                     json={
-                        "model": "qwen/qwen-2.5-72b-instruct",
+                        "model": "llama-3.3-70b-versatile",
                         "messages": messages,
                         "max_tokens": 300,
                         "temperature": 0.1
@@ -1880,19 +1865,14 @@ Updated Memory:"""
 
     logger.error(f"Failed to update memory for {user_id[:8]} after {max_retries} retries due to rate limiting.")
 
+def get_groq_headers():
+    return {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+
 def get_openai_headers():
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-def get_openrouter_headers():
-    return {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "HTTP-Referer": "https://heloxai.xyz",
-        "X-Title": "HeloXAi",
-        "Content-Type": "application/json"
-    }
-
 # =========================
-# WEB SEARCH INTEGRATION (TAVILY)
+# WEB SEARCH INTEGRATION (TAVILY) - UPDATED
 # =========================
 async def perform_web_search(query: str) -> Dict[str, Any]:
     """Performs a web search using Tavily API and returns formatted results + images."""
@@ -2002,23 +1982,11 @@ def extract_video_frames(video_bytes: bytes, max_frames: int = 4) -> list:
         if os.path.exists(tmp_file_path):
             os.remove(tmp_file_path)
 
-async def fetch_logo_image() -> Optional[bytes]:
-    """Fetches the logo image for watermarking"""
-    if not LOGO_URL:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(LOGO_URL)
-            if response.status_code == 200:
-                return response.content
-    except Exception as e:
-        logger.warning(f"Failed to fetch logo: {e}")
-    return None
-
 async def add_watermark_to_video(video_url: str) -> str:
     """Add transparent watermark to video"""
     try:
         from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
+        import tempfile
         
         logo_bytes = await fetch_logo_image()
         if not logo_bytes:
@@ -2153,7 +2121,7 @@ Preserve important technical details.{file_context}"""
         async def gen():
             task = asyncio.current_task()
             try:
-                async for token in stream_openrouter_chat(messages):
+                async for token in stream_groq_chat(messages):
                     if task.cancelled():
                         break
                     yield sse({"type": "token", "text": token})
@@ -2166,10 +2134,10 @@ Preserve important technical details.{file_context}"""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=get_openrouter_headers(),
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=get_groq_headers(),
             json={
-                "model": "qwen/qwen-2.5-72b-instruct",
+                "model": "llama-3.3-70b-versatile",
                 "messages": messages
             }
         )
@@ -2256,7 +2224,7 @@ async def get_history(conv_id: str, limit: int = 50):
     
     return [{"role": m["role"], "content": m["content"]} for m in final_messages]
 
-async def stream_openrouter_chat(messages: list, model: str = "qwen/qwen-2.5-72b-instruct", max_tokens: int = 8192):
+async def stream_groq_chat(messages: list, model: str = "llama-3.3-70b-versatile", max_tokens: int = 8192):
     max_retries = 2
     base_wait = 5
     
@@ -2265,19 +2233,19 @@ async def stream_openrouter_chat(messages: list, model: str = "qwen/qwen-2.5-72b
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream(
                     "POST",
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=get_openrouter_headers(),
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=get_groq_headers(),
                     json={"model": model, "messages": messages, "stream": True, "max_tokens": max_tokens}
                 ) as resp:
                     
                     if resp.status_code == 429:
-                        logger.warning(f"OpenRouter Rate Limit hit (Attempt {attempt+1}). Waiting...")
+                        logger.warning(f"Groq Rate Limit hit (Attempt {attempt+1}). Waiting...")
                         await asyncio.sleep(base_wait * (attempt + 1))
                         continue 
 
                     if resp.status_code != 200:
                         error_text = await resp.aread()
-                        logger.error(f"OpenRouter API Error {resp.status_code}: {error_text}")
+                        logger.error(f"Groq API Error {resp.status_code}: {error_text}")
                         raise Exception(f"AI Service Error ({resp.status_code})")
 
                     async for line in resp.aiter_lines():
@@ -2320,7 +2288,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
             active_streams[user["id"]] = task
             try:
                 full_text = ""
-                async for token in stream_openrouter_chat(messages):
+                async for token in stream_groq_chat(messages):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2346,9 +2314,9 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=get_openrouter_headers(),
-            json={"model": "qwen/qwen-2.5-72b-instruct", "messages": messages, "max_tokens": 8000}
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=get_groq_headers(),
+            json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 8000}
         )
         r.raise_for_status()
         reply = r.json()["choices"][0]["message"]["content"]
@@ -2389,7 +2357,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "3.0.2",
+        "version": "2.7.0",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2400,9 +2368,7 @@ async def root():
             "media_generation": "free_hugging_face_sd3_svd",
             "web_search": "tavily_with_images",
             "math_logic": "step_by_step_reasoning",
-            "translation": "native_llm_capability",
-            "tts": "openai",
-            "llm": "openrouter_qwen"
+            "translation": "native_llm_capability"
         }
     }
 
@@ -2466,6 +2432,7 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
                 if response.status_code != 200:
                     error_text = response.text
                     logger.error(f"HF API Error: {error_text}")
+                    # Often HF returns 503 if model is loading, or 500 for other issues
                     if response.status_code == 503:
                         yield sse({"type": "error", "message": "Model is loading, please try again in a few moments."})
                     else:
@@ -2570,7 +2537,7 @@ async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: st
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 # =========================
-# MAIN ENDPOINT (FIXED LOGIC)
+# MAIN ENDPOINT (UPDATED FOR CHATGPT FEELING)
 # =========================
 
 @app.post("/ask/universal")
@@ -2620,54 +2587,7 @@ async def ask_universal(req: Request, res: Response):
     user = await get_user(req, res, remember=remember)
 
     # =========================
-    # FIX: VALIDATE/CREATE CONVERSATION BEFORE ROUTING
-    # =========================
-    
-    # Check if conversation ID is valid and belongs to user
-    conversation_exists = False
-    if conv_id:
-        check = await _execute_supabase_with_retry(
-            supabase.table("conversations")
-            .select("id")
-            .eq("id", conv_id)
-            .eq("user_id", user["id"])
-            .limit(1)
-        )
-        if check.data:
-            conversation_exists = True
-        else:
-            logger.warning(f"Conversation {conv_id} not found or access denied. Creating new.")
-            conv_id = None # Force creation of new ID
-
-    if not conv_id:
-        conv_id = str(uuid.uuid4())
-        conversation_exists = False
-    
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    # Ensure conversation exists in DB
-    if not conversation_exists:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations").insert({
-                "id": conv_id,
-                "user_id": user["id"],
-                "title": prompt[:30],
-                "created_at": now_iso,
-                "updated_at": now_iso
-            })
-        )
-    else:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations").update({
-                "updated_at": now_iso
-            }).eq("id", conv_id)
-        )
-
-    # Save User Message immediately
-    await save_message(user["id"], conv_id, "user", prompt)
-
-    # =========================
-    # INTENT DETECTION & ROUTING
+    # INTENT DETECTION & ROUTING (FIXED)
     # =========================
     
     intent = detect_intent(prompt)
@@ -2698,6 +2618,46 @@ async def ask_universal(req: Request, res: Response):
     search_keywords = ["latest", "news", "current", "recent", "today", "who is", "what is", "price", "weather", "stock"]
     if any(kw in prompt.lower() for kw in search_keywords):
         needs_search = True
+
+    conversation_exists = False
+    
+    if conv_id:
+        check = await _execute_supabase_with_retry(
+            supabase.table("conversations")
+            .select("id")
+            .eq("id", conv_id)
+            .eq("user_id", user["id"])
+            .limit(1)
+        )
+        if check.data:
+            conversation_exists = True
+        else:
+            logger.warning(f"Conversation {conv_id} not found. Creating new.")
+            conv_id = None
+
+    if not conv_id:
+        conv_id = str(uuid.uuid4())
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if not conversation_exists:
+        await _execute_supabase_with_retry(
+            supabase.table("conversations").insert({
+                "id": conv_id,
+                "user_id": user["id"],
+                "title": prompt[:30],
+                "created_at": now_iso,
+                "updated_at": now_iso
+            })
+        )
+    else:
+        await _execute_supabase_with_retry(
+            supabase.table("conversations").update({
+                "updated_at": now_iso
+            }).eq("id", conv_id)
+        )
+
+    await save_message(user["id"], conv_id, "user", prompt)
 
     if stream:
         async def event_gen():
@@ -2750,7 +2710,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
 
                 full_history = [{"role": "system", "content": base_system}] + history
 
-                async for token in stream_openrouter_chat(full_history):
+                async for token in stream_groq_chat(full_history):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2793,8 +2753,8 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         full_history = [{"role": "system", "content": base_system}] + history
         
         async with httpx.AsyncClient() as client:
-            r = await openrouter_request_with_retry(client, {
-                "model": "qwen/qwen-2.5-72b-instruct",
+            r = await groq_request_with_retry(client, {
+                "model": "llama-3.3-70b-versatile",
                 "messages": full_history,
                 "max_tokens": 1024
             })
@@ -3017,7 +2977,7 @@ Be organized and clear in your analysis."""
                     "files": result.files
                 })
                 
-                async for token in stream_openrouter_chat(messages):
+                async for token in stream_groq_chat(messages):
                     if task.cancelled():
                         break
                     yield sse({"type": "token", "text": token})
@@ -3030,9 +2990,9 @@ Be organized and clear in your analysis."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=get_openrouter_headers(),
-            json={"model": "qwen/qwen-2.5-72b-instruct", "messages": messages}
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=get_groq_headers(),
+            json={"model": "llama-3.3-70b-versatile", "messages": messages}
         )
         r.raise_for_status()
 
@@ -3172,13 +3132,13 @@ async def stop_generation(req: Request, res: Response):
         return {"status": "stopped"}
     return {"status": "no_active_stream"}
 
-async def openrouter_request_with_retry(client, payload):
+async def groq_request_with_retry(client, payload):
     max_retries = 5
     for attempt in range(max_retries):
         try:
             r = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=get_openrouter_headers(),
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=get_groq_headers(),
                 json=payload
             )
             r.raise_for_status()
@@ -3263,7 +3223,7 @@ async def regenerate(req: Request, res: Response):
             full_history = [{"role": "system", "content": base_system}] + history
             
             full_text = ""
-            async for token in stream_openrouter_chat(full_history):
+            async for token in stream_groq_chat(full_history):
                 if task and task.cancelled():
                     break
                 full_text += token
@@ -3372,68 +3332,48 @@ async def analyze_intent_endpoint(req: Request):
     }
 
 # =========================
-# MEDIA ENDPOINTS (OPENAI TTS/STT)
+# MEDIA ENDPOINTS (OPTIMIZED FOR SPEED)
 # =========================
 
 @app.post("/tts")
 async def text_to_speech(req: Request):
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "OpenAI API Key missing")
-    
     data = await req.json()
-    text = data.get("text", "")
+    text = data.get("text")
     voice = data.get("voice", "alloy")
-
-    valid_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-    if voice not in valid_voices:
-        raise HTTPException(400, f"Invalid voice. Choose from {valid_voices}")
 
     if not text:
         raise HTTPException(400, "text required")
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OpenAI Key missing")
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
+    async def stream_audio():
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream(
+                "POST",
                 "https://api.openai.com/v1/audio/speech",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "tts-1",
-                    "input": text,
-                    "voice": voice
-                }
-            )
-            
-            if response.status_code != 200:
-                error_text = response.text
-                logger.error(f"OpenAI TTS Error: {error_text}")
-                raise HTTPException(response.status_code, f"TTS Failed: {error_text}")
+                headers=get_openai_headers(),
+                json={"model": "tts-1", "voice": voice, "input": text, "response_format": "mp3"}
+            ) as response:
+                if response.status_code != 200:
+                    error_body = await response.aread()
+                    logger.error(f"TTS Error: {error_body}")
+                    return
+                
+                async for chunk in response.aiter_bytes():
+                    yield chunk
 
-            audio_bytes = response.content
-
-            async def stream_audio():
-                yield audio_bytes
-
-            return StreamingResponse(stream_audio(), media_type="audio/mpeg")
-            
-    except httpx.ConnectError:
-        raise HTTPException(500, "Connection failed.")
-    except Exception as e:
-        logger.error(f"OpenAI TTS Exception: {e}")
-        raise HTTPException(500, f"Audio generation failed: {str(e)}")
+    return StreamingResponse(stream_audio(), media_type="audio/mpeg")
 
 @app.get("/tts/voices")
 async def get_voices():
     return {
         "voices": [
-            {"id": "alloy", "name": "Alloy", "gender": "Neutral", "accent": "American"},
-            {"id": "echo", "name": "Echo", "gender": "Male", "accent": "American"},
-            {"id": "fable", "name": "Fable", "gender": "British", "accent": "British"},
-            {"id": "onyx", "name": "Onyx", "gender": "Male", "accent": "American"},
-            {"id": "nova", "name": "Nova", "gender": "Female", "accent": "American"},
-            {"id": "shimmer", "name": "Shimmer", "gender": "Female", "accent": "American"},
+            {"id": "alloy", "name": "Alloy"},
+            {"id": "echo", "name": "Echo"},
+            {"id": "fable", "name": "Fable"},
+            {"id": "onyx", "name": "Onyx"},
+            {"id": "nova", "name": "Nova"},
+            {"id": "shimmer", "name": "Shimmer"}
         ]
     }
 
